@@ -11,6 +11,32 @@
 #include "cli/note.h"
 
 /**
+ * Return the type of @entry, falling back to lstat(2) when readdir(3)
+ * reports DT_UNKNOWN: not every filesystem fills in d_type (XFS with
+ * ftype=0, some FUSE and network filesystems).  The caller has already
+ * chdir(2)ed into the directory being cleaned, so d_name is relative
+ * to the current working directory.
+ */
+static int get_dtype(const struct dirent *entry)
+{
+	struct stat st;
+
+	if (entry->d_type != DT_UNKNOWN)
+		return entry->d_type;
+
+	if (lstat(entry->d_name, &st) < 0)
+		return DT_UNKNOWN;
+
+	if (S_ISDIR(st.st_mode))
+		return DT_DIR;
+	if (S_ISLNK(st.st_mode))
+		return DT_LNK;
+	if (S_ISREG(st.st_mode))
+		return DT_REG;
+	return DT_UNKNOWN;
+}
+
+/**
  * Return the path to a directory where temporary files should be
  * created.
  */
@@ -111,7 +137,7 @@ static int clean_temp_cwd()
 		 * exists (common with the /dev/{stdin,fd,...} symlinks
 		 * bubblewrap leaves behind in emulated tmpfs dirs).
 		 * We only need to unlink the symlink itself.  */
-		if (entry->d_type != DT_LNK) {
+		if (get_dtype(entry) != DT_LNK) {
 			status = chmod(entry->d_name, 0700);
 			if (status < 0) {
 				note(NULL, WARNING, SYSTEM, "cant chmod '%s'", entry->d_name);
@@ -120,7 +146,7 @@ static int clean_temp_cwd()
 			}
 		}
 
-		if (entry->d_type == DT_DIR) {
+		if (get_dtype(entry) == DT_DIR) {
 			status = chdir(entry->d_name);
 			if (status < 0) {
 				note(NULL, WARNING, SYSTEM, "can't chdir '%s'", entry->d_name);

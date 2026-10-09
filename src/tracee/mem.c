@@ -150,7 +150,8 @@ static int ptrace_pokedata_or_via_stub(Tracee *tracee, word_t addr, word_t word)
 		do
 		{
 			ptrace(PTRACE_CONT, tracee->pid, 0, 0);
-			waitpid(tracee->pid, &wstatus, 0);
+			while (waitpid(tracee->pid, &wstatus, 0) < 0 && errno == EINTR)
+				;
 			// For SIGSTOP, we kill tracee after handling POKEDATA
 			if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGSTOP)
 			{

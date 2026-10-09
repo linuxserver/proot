@@ -74,7 +74,7 @@
 #define FIONREAD 0x541B
 #endif
 
-#define MAX_SHADOW_PIPES 32
+#define MAX_SHADOW_PIPES 128
 
 /* The racing writer runs within milliseconds of the close it lost to,
  * even with every one of its syscalls stopping for proot.  Past this
@@ -278,12 +278,16 @@ void shadow_pipes_set_timer(bool enabled)
 	static bool armed = false;
 	struct itimerval timer;
 
-	if (!enabled && !armed)
+	/* One syscall per transition, not per event: the timer is
+	 * periodic while shadows are held and off otherwise.  */
+	if (enabled == armed)
 		return;
 
 	bzero(&timer, sizeof(timer));
-	if (enabled)
+	if (enabled) {
 		timer.it_value.tv_usec = SHADOW_TIMER_MS * 1000;
+		timer.it_interval.tv_usec = SHADOW_TIMER_MS * 1000;
+	}
 
 	if (setitimer(ITIMER_REAL, &timer, NULL) < 0)
 		return;

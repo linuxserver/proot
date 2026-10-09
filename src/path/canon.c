@@ -29,6 +29,8 @@
 #include <string.h>    /* string(3), */
 #include <assert.h>    /* assert(3), */
 #include <stdio.h>     /* sscanf(3), */
+#include <stdlib.h>    /* getenv(3), free(3), */
+#include <stdint.h>    /* uint64_t, uintptr_t, */
 
 #include "path/canon.h"
 #include "path/path.h"
@@ -37,6 +39,125 @@
 #include "path/proc.h"
 #include "path/f2fs-bug.h"
 #include "extension/extension.h"
+
+/*
+ * Cache of the directories canonicalize() has already resolved.
+ *
+ * Every path syscall walks its path component by component, with a
+ * binding lookup, an extension notification and an lstat(2) on the
+ * host for each one: a dozen host syscalls to translate one guest
+ * syscall, most of them on the same few directories (/usr/lib, the
+ * app's prefix, $HOME/.cache, ...).  Only the final component really
+ * depends on the syscall; the directories leading to it are what
+ * they were last time unless something replaced one of them.
+ *
+ * So the host path of every non-final component found to be a plain
+ * directory is remembered here, keyed by the name-space it was
+ * resolved in (bindings are per name-space).  The cache is flushed
+ * as a whole, by bumping its generation, whenever anything may have
+ * turned such a directory into something else: a syscall that
+ * creates or removes links or directories (symlink, rename, unlink,
+ * rmdir, link, mount, ...), flushed both when it starts and when it
+ * completes, since other tracees run meanwhile; and any change of
+ * bindings.  Changes made from outside PRoot are not seen, so
+ * PROOT_NO_PATH_CACHE=1 turns the cache off.  Extensions that act on
+ * every component (fake_id0, link2symlink) disable it as well.
+ */
+#define PATH_CACHE_SLOTS 4096
+
+typedef struct {
+	const void *fs;			/* the name-space this was resolved in */
+	unsigned long generation;	/* valid while equal to path_cache_generation */
+	char *guest;			/* canonical guest path of the directory */
+	char *host;			/* its translation at that time */
+} PathCacheEntry;
+
+static PathCacheEntry path_cache[PATH_CACHE_SLOTS];
+static unsigned long path_cache_generation = 1;
+static int path_cache_state = -1;	/* -1: not probed yet, 0: off, 1: on */
+
+/**
+ * Forget every cached directory.
+ */
+void path_cache_invalidate(void)
+{
+	path_cache_generation++;
+}
+
+/**
+ * Tell whether the cache can serve @tracee: not while the glue is
+ * being built, not under extensions that look at every component.
+ */
+static bool path_cache_usable(const Tracee *tracee)
+{
+	if (path_cache_state < 0)
+		path_cache_state = (getenv("PROOT_NO_PATH_CACHE") == NULL);
+
+	/* Extensions that look at every component of every path have
+	 * to keep seeing them; the others (mountinfo, kompat, sysvipc,
+	 * ...) don't care about intermediate directories.  */
+	return path_cache_state == 1
+		&& tracee->glue_type == 0
+		&& get_extension(tracee, fake_id0_callback) == NULL
+		&& get_extension(tracee, link2symlink_callback) == NULL;
+}
+
+static size_t path_cache_slot(const void *fs, const char *guest)
+{
+	uint64_t hash = 14695981039346656037ULL;	/* FNV-1a */
+	const unsigned char *c;
+
+	hash ^= (uint64_t) (uintptr_t) fs;
+	hash *= 1099511628211ULL;
+	for (c = (const unsigned char *) guest; *c != '\0'; c++) {
+		hash ^= *c;
+		hash *= 1099511628211ULL;
+	}
+	return (size_t) (hash % PATH_CACHE_SLOTS);
+}
+
+/**
+ * Copy into @host the cached translation of the directory @guest in
+ * @tracee's name-space.  This function returns false if it is not
+ * cached (or no longer valid).
+ */
+static bool path_cache_lookup(const Tracee *tracee, const char *guest, char host[PATH_MAX])
+{
+	const PathCacheEntry *entry = &path_cache[path_cache_slot(tracee->fs, guest)];
+
+	if (entry->guest == NULL
+	    || entry->generation != path_cache_generation
+	    || entry->fs != tracee->fs
+	    || strcmp(entry->guest, guest) != 0)
+		return false;
+
+	strcpy(host, entry->host);
+	return true;
+}
+
+/**
+ * Remember that the directory @guest translates to @host in @tracee's
+ * name-space, as of the current generation.
+ */
+static void path_cache_insert(const Tracee *tracee, const char *guest, const char *host)
+{
+	PathCacheEntry *entry = &path_cache[path_cache_slot(tracee->fs, guest)];
+	char *new_guest = strdup(guest);
+	char *new_host = strdup(host);
+
+	if (new_guest == NULL || new_host == NULL) {
+		free(new_guest);
+		free(new_host);
+		return;
+	}
+
+	free(entry->guest);
+	free(entry->host);
+	entry->fs = tracee->fs;
+	entry->generation = path_cache_generation;
+	entry->guest = new_guest;
+	entry->host = new_host;
+}
 
 /**
  * Put an end-of-string ('\0') right before the last component of @path.
@@ -177,11 +298,11 @@ static inline int substitute_binding_stat(Tracee *tracee, Finality finality, uns
 	}
 
 	/* Return an error if a non-final component isn't a
-	 * directory nor a symlink.  The error is "No such
-	 * file or directory" if this component doesn't exist,
+	 * directory nor a symlink.  The error depends on why the
+	 * component could not be accessed (ENOENT, EACCES, ...),
 	 * otherwise the error is "Not a directory".  */
 	if (!IS_FINAL(finality) && !S_ISDIR(statl.st_mode) && !S_ISLNK(statl.st_mode))
-		return (status < 0 ? -ENOENT : -ENOTDIR);
+		return (status < 0 ? -errno : -ENOTDIR);
 
 	return (S_ISLNK(statl.st_mode) ? 1 : 0);
 }
@@ -261,9 +382,20 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
 		 * symlink.  For this latter case, we check that the
 		 * symlink points to a directory once it is
 		 * canonicalized, at the end of this loop.  */
-		status = substitute_binding_stat(tracee, finality, recursion_level, scratch_path, host_path);
-		if (status < 0)
-			return status;
+		if (!IS_FINAL(finality) && path_cache_usable(tracee)
+		    && path_cache_lookup(tracee, scratch_path, host_path)) {
+			/* A directory resolved earlier in this name-space
+			 * and untouched since: no need to stat it again.  */
+			status = 0;
+		}
+		else {
+			status = substitute_binding_stat(tracee, finality, recursion_level, scratch_path, host_path);
+			if (status < 0)
+				return status;
+
+			if (status == 0 && !IS_FINAL(finality) && path_cache_usable(tracee))
+				path_cache_insert(tracee, scratch_path, host_path);
+		}
 
 		/* Nothing special to do if it's not a link or if we
 		 * explicitly ask to not dereference 'user_path', as
@@ -364,6 +496,9 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
 		status = substitute_binding_stat(tracee, finality, recursion_level, guest_path, host_path);
 		if (status < 0)
 			return status;
+
+		if (status == 0 && !IS_FINAL(finality) && path_cache_usable(tracee))
+			path_cache_insert(tracee, guest_path, host_path);
 
 		/* Here, 'guest_path' shouldn't be a symlink anymore,
 		 * unless it is a named file descriptor.  */

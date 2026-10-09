@@ -37,6 +37,7 @@
 #include "tracee/reg.h"
 #include "tracee/mem.h"
 #include "path/binding.h"
+#include "path/canon.h"
 #include "syscall/sysnum.h"
 #include "tracee/event.h"
 #include "ptrace/ptrace.h"
@@ -189,6 +190,8 @@ Tracee *new_dummy_tracee(TALLOC_CTX *context)
 	tracee->ctx = talloc_new(tracee);
 	if (tracee->ctx == NULL)
 		goto no_mem;
+
+	path_cache_invalidate();
 
 	/* By default new tracees have an empty file-system
 	 * name-space and heap.  */
@@ -530,6 +533,8 @@ int new_child(Tracee *parent, word_t clone_flags)
 		child->fs = talloc_reference(child, parent->fs);
 	}
 	else {
+		path_cache_invalidate();
+
 		/* File-system name-space is copied.  */
 		child->fs = talloc_zero(child, FileSystemNameSpace);
 		if (child->fs == NULL)
@@ -586,6 +591,7 @@ int new_child(Tracee *parent, word_t clone_flags)
 	 * already believes it lives in.  Either way it gets rtnetlink
 	 * answers for a namespace of its own (see enter.c).  */
 	child->fake_netns = parent->fake_netns || parent->clone_stripped_newnet;
+	child->netlink_filter_installed = parent->netlink_filter_installed;
 	parent->clone_stripped_newnet = false;
 
 	/* Open fds survive fork(2)/clone(2), so the child has to keep

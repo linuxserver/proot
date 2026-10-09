@@ -46,7 +46,8 @@
 #include <netpacket/packet.h> /* struct sockaddr_ll (AF_PACKET) */
 #include <sys/ioctl.h>   /* ioctl(2): SIOCGIFMTU / SIOCGIFHWADDR */
 #include <sys/time.h>    /* struct timeval, for SO_RCVTIMEO */
-#include "syscall/pipe_shadow.h"
+#include <sys/syscall.h> /* syscall(2), __NR_statx */
+#include "syscall/seccomp.h"
 
 /* ABI-stable rtnetlink constants we synthesise for the loopback reply.
  * Defined locally so we needn't pull in <linux/if.h> / <linux/if_arp.h>,
@@ -113,6 +114,14 @@ static int translate_path2(Tracee *tracee, int dir_fd, char path[PATH_MAX], Reg 
 	status = translate_path(tracee, new_path, dir_fd, path, type != SYMLINK);
 	if (status < 0)
 		return status;
+
+	/* A path bound to itself translates to itself: leave the
+	 * tracee's argument alone rather than copy an identical
+	 * string into its memory (and push registers) at every stop.
+	 * Font lookups in particular hit such paths by the thousand
+	 * per second.  */
+	if (strcmp(new_path, path) == 0)
+		return 0;
 
 	return set_sysarg_path(tracee, new_path, reg);
 }
@@ -506,6 +515,28 @@ void apply_emulated_pivot_root(Tracee *tracee)
 }
 
 /**
+ * Tell whether the host kernel implements statx(2).  Where it does
+ * not, the exit stage of statx(2) emulates it with stat(2).
+ */
+static bool host_has_statx(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+#ifdef __NR_statx
+		unsigned char buffer[256];
+
+		errno = 0;
+		cached = (syscall(__NR_statx, AT_FDCWD, "/", 0, 0, buffer) == 0
+			  || errno != ENOSYS);
+#else
+		cached = 0;
+#endif
+	}
+	return cached == 1;
+}
+
+/**
  * Helpers for emulating AF_NETLINK / NETLINK_ROUTE traffic.  Some
  * environments deny the tracee a real netlink socket (Android's
  * SELinux policy on untrusted_app domains, seccomp filters inherited
@@ -525,6 +556,32 @@ void apply_emulated_pivot_root(Tracee *tracee)
  * needs); otherwise the tracee gets a real netlink socket and
  * ordinary users like c-ares (dnf, getaddrinfo, ...) keep working.
  */
+static bool host_blocks_af_netlink(const Tracee *tracee);
+
+/**
+ * Make @tracee (and its later children) stop for netlink traffic and
+ * close(2) if PRoot has something to emulate on its NETLINK_ROUTE
+ * sockets: substitutes for sockets the host refuses, or acks for a
+ * network namespace the tracee only believes it owns.  A real socket
+ * in the real namespace needs nothing, so Chromium-style programs
+ * watching the network keep their traffic untraced.  See
+ * install_extra_filter() for @reissue.
+ */
+static void ensure_netlink_filter(Tracee *tracee, bool reissue)
+{
+	int status;
+
+	if (tracee->netlink_filter_installed)
+		return;
+	if (!tracee->fake_netns && !host_blocks_af_netlink(tracee))
+		return;
+
+	status = install_extra_filter(tracee, netlink_sysnums, reissue);
+	if (status < 0)
+		VERBOSE(tracee, 1, "can't install the netlink seccomp filter: %s", strerror(-status));
+	else
+		tracee->netlink_filter_installed = true;
+}
 
 static bool host_blocks_af_netlink(const Tracee *tracee)
 {
@@ -2168,6 +2225,11 @@ int translate_syscall_enter(Tracee *tracee)
 			}
 			tracee->sysexit_pending = true;
 			tracee->restart_how = PTRACE_SYSCALL;
+
+			/* From now on this tracee and its descendants may
+			 * have to stop for the traffic on that socket and
+			 * for close(2); other lineages never do.  */
+			ensure_netlink_filter(tracee, true);
 		}
 		status = 0;
 		break;
@@ -2482,6 +2544,11 @@ int translate_syscall_enter(Tracee *tracee)
 			tracee->fake_netns = true;
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
+		/* A NETLINK_ROUTE socket opened before the tracee asked for
+		 * its own network namespace needs the ack emulation from
+		 * now on: use this voided syscall to install the filter.  */
+		if (tracee->fake_netns && tracee->netlink_route_fds_count > 0)
+			ensure_netlink_filter(tracee, false);
 		status = 0;
 		break;
 
@@ -2581,6 +2648,7 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_fstatat64:
 	case PR_newfstatat:
 	case PR_utimensat:
+	case PR_utimensat_time64:
 	case PR_name_to_handle_at:
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 
@@ -2815,6 +2883,14 @@ int translate_syscall_enter(Tracee *tracee)
 			SYSARG_2,
 			(peek_reg(tracee, CURRENT, SYSARG_3) & AT_SYMLINK_NOFOLLOW) ? SYMLINK : REGULAR
 		);
+
+		/* The exit stage emulates statx(2) for a host kernel that
+		 * lacks it; extensions that rewrite its result ask for that
+		 * stage through their own filter entries.  */
+		if (status >= 0 && !host_has_statx()) {
+			tracee->sysexit_pending = true;
+			tracee->restart_how = PTRACE_SYSCALL;
+		}
 		break;
 
 	case PR_prctl:
@@ -2946,11 +3022,9 @@ int translate_syscall_enter(Tracee *tracee)
 		unmark_fake_netlink_fd(tracee, closed_fd);
 		unmark_netlink_route_fd(tracee, closed_fd);
 
-		/* Keep a shadow read end so child writers don't get
-		 * EPIPE when the parent closes its copy first (ptrace
-		 * serialisation makes this happen routinely, breaking
-		 * process substitution like `echo <(echo a)`).  */
-		shadow_pipe_read_end(tracee->pid, closed_fd);
+		/* close(2) stops here only for lineages that own a netlink
+		 * socket (see netlink_sysnums); pipe read ends are shadowed
+		 * when the pipe is created, see exit.c.  */
 		break;
 	}
 

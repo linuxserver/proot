@@ -27,6 +27,8 @@
 
 #include "syscall/syscall.h"
 #include "syscall/chain.h"
+#include "syscall/sysnum.h"
+#include "path/canon.h"
 #include "extension/extension.h"
 #include "tracee/tracee.h"
 #include "tracee/reg.h"
@@ -137,6 +139,34 @@ static bool kernel_cancels_voided_syscall(void)
 	return (long) SYSCALL_AVOIDER < 0;
 }
 
+/**
+ * Tell whether @sysnum may turn a directory the path cache knows
+ * into something else (see canon.c).
+ */
+static bool alters_path_cache(Sysnum sysnum)
+{
+	switch (sysnum) {
+	case PR_symlink:
+	case PR_symlinkat:
+	case PR_link:
+	case PR_linkat:
+	case PR_rename:
+	case PR_renameat:
+	case PR_renameat2:
+	case PR_unlink:
+	case PR_unlinkat:
+	case PR_rmdir:
+	case PR_mount:
+	case PR_umount:
+	case PR_umount2:
+	case PR_pivot_root:
+	case PR_chroot:
+		return true;
+	default:
+		return false;
+	}
+}
+
 void translate_syscall(Tracee *tracee)
 {
 	const bool is_enter_stage = IS_IN_SYSENTER(tracee);
@@ -144,7 +174,12 @@ void translate_syscall(Tracee *tracee)
 
 	assert(tracee->exe != NULL);
 
-	status = fetch_regs(tracee);
+	if (tracee->_regs_prefetched) {
+		tracee->_regs_prefetched = false;
+		status = 0;
+	}
+	else
+		status = fetch_regs(tracee);
 	if (status < 0)
 		return;
 
@@ -177,6 +212,15 @@ void translate_syscall(Tracee *tracee)
 			save_current_regs(tracee, ORIGINAL);
 			status = translate_syscall_enter(tracee);
 			save_current_regs(tracee, MODIFIED);
+
+			/* The path cache can't tell which directories this
+			 * syscall is about to replace: flush it now, and
+			 * again at the exit stage once the kernel is done.  */
+			if (alters_path_cache(get_sysnum(tracee, ORIGINAL))) {
+				path_cache_invalidate();
+				tracee->sysexit_pending = true;
+				tracee->restart_how = PTRACE_SYSCALL;
+			}
 		}
 		else {
 			if (tracee->chain.sysnum_workaround_state != SYSNUM_WORKAROUND_PROCESS_REPLACED_CALL) {
@@ -258,6 +302,9 @@ void translate_syscall(Tracee *tracee)
 #endif
 
 		print_current_regs(tracee, 5, "sysexit start");
+
+		if (alters_path_cache(get_sysnum(tracee, ORIGINAL)))
+			path_cache_invalidate();
 
 		/* Translate the syscall only if it was actually
 		 * requested by the tracee, it is not a syscall

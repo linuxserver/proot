@@ -86,7 +86,8 @@ static bool probe_f2fs_bug(const Tracee *tracee) {
 		close(fd);
 		_exit(0);
 	} else if (pid != -1) {
-		waitpid(pid, &wstatus, 0);
+		while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR)
+			;
 	} else {
 		note(tracee, WARNING, SYSTEM, "fork() failed for f2fs bug probe");
 		goto end_delete_temp_files;
