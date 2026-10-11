@@ -276,6 +276,8 @@ int substitute_binding(const Tracee *tracee, Side side, char path[PATH_MAX])
  */
 void remove_binding_from_all_lists(const Tracee *tracee, Binding *binding)
 {
+	path_cache_invalidate();
+
        if (IS_LINKED(binding, link.pending))
 	       CIRCLEQ_REMOVE_(tracee, binding, pending);
 
@@ -299,6 +301,8 @@ static void insort_binding(const Tracee *tracee, Side side, Binding *binding)
 	Binding *iterator;
 	Binding *previous = NULL;
 	Binding *next = CIRCLEQ_FIRST(HEAD(tracee, side));
+
+	path_cache_invalidate();
 
 	/* Find where it should be added in the list.  */
 	CIRCLEQ_FOREACH_(tracee, iterator, side) {

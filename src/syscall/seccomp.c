@@ -40,6 +40,10 @@
 #include <assert.h>        /* assert(3), */
 
 #include "syscall/seccomp.h"
+#include "syscall/chain.h"
+#include "tracee/mem.h"
+#include "tracee/reg.h"
+#include "tracee/abi.h"
 #include "tracee/tracee.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
@@ -50,6 +54,13 @@
 #include "attribute.h"
 
 #define DEBUG_FILTER(...) /* fprintf(stderr, __VA_ARGS__) */
+
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
 
 /**
  * Allocate an empty @program->filter.  This function returns -errno
@@ -250,19 +261,17 @@ static void free_program_filter(struct sock_fprog *program)
  *
  * This function returns -errno if an error occurred, otherwise 0.
  */
-static int set_seccomp_filters(const FilteredSysnum *sysnums)
+static int build_program_filter(const FilteredSysnum *sysnums, struct sock_fprog *program)
 {
 	SeccompArch seccomp_archs[] = SECCOMP_ARCHS;
 	size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
-
-	struct sock_fprog program = { .len = 0, .filter = NULL };
 	size_t nb_traced_syscalls;
 	size_t i, j, k;
 	int status;
 
-	status = new_program_filter(&program);
+	status = new_program_filter(program);
 	if (status < 0)
-		goto end;
+		return status;
 
 	/* For each handled architectures */
 	for (i = 0; i < nb_archs; i++) {
@@ -280,9 +289,9 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 		}
 
 		/* Filter: if handled architecture */
-		status = start_arch_section(&program, seccomp_archs[i].value, nb_traced_syscalls);
+		status = start_arch_section(program, seccomp_archs[i].value, nb_traced_syscalls);
 		if (status < 0)
-			goto end;
+			return status;
 
 		for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
 			for (k = 0; sysnums[k].value != PR_void; k++) {
@@ -292,19 +301,32 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 					continue;
 
 				/* Filter: trace if handled syscall */
-				status = add_trace_syscall(&program, syscall, sysnums[k].flags);
+				status = add_trace_syscall(program, syscall, sysnums[k].flags);
 				if (status < 0)
-					goto end;
+					return status;
 			}
 		}
 
 		/* Filter: allow untraced syscalls for this architecture */
-		status = end_arch_section(&program, nb_traced_syscalls);
+		status = end_arch_section(program, nb_traced_syscalls);
 		if (status < 0)
-			goto end;
+			return status;
 	}
 
-	status = finalize_program_filter(&program);
+	return finalize_program_filter(program);
+}
+
+/**
+ * Build the BPF program for @sysnums (see build_program_filter()) and
+ * enable it for the calling process and all of its future children.
+ * This function returns -errno if an error occurred, otherwise 0.
+ */
+static int set_seccomp_filters(const FilteredSysnum *sysnums)
+{
+	struct sock_fprog program = { .len = 0, .filter = NULL };
+	int status;
+
+	status = build_program_filter(sysnums, &program);
 	if (status < 0)
 		goto end;
 
@@ -342,18 +364,13 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_chroot,		0 },
 	{ PR_clone,		0 },
 	{ PR_clone3,		0 },
-	{ PR_close,		0 },
 	{ PR_connect,		0 },
 	{ PR_creat,		0 },
-	{ PR_recvfrom,		0 },
-	{ PR_recvmsg,		0 },
-	{ PR_sendmsg,		0 },
-	{ PR_sendto,		0 },
 	{ PR_socket,		FILTER_SYSEXIT },
 	{ PR_execve,		FILTER_SYSEXIT },
 	{ PR_execveat,		FILTER_SYSEXIT },
 	{ PR_faccessat,		0 },
-	{ PR_faccessat2,	FILTER_SYSEXIT },
+	{ PR_faccessat2,	0 },
 	{ PR_fchdir,		FILTER_SYSEXIT },
 	{ PR_fchmodat,		0 },
 	{ PR_fchmodat2,		0 },
@@ -394,6 +411,8 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_open,		0 },
 	{ PR_openat,		0 },
 	{ PR_openat2,		0 },
+	{ PR_pipe,		FILTER_SYSEXIT },
+	{ PR_pipe2,		FILTER_SYSEXIT },
 	{ PR_pivot_root,	FILTER_SYSEXIT },
 	{ PR_prctl, 		0 },
 	{ PR_prlimit64,		FILTER_SYSEXIT },
@@ -412,7 +431,7 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_stat64,		0 },
 	{ PR_statfs,		FILTER_SYSEXIT },
 	{ PR_statfs64,		FILTER_SYSEXIT },
-	{ PR_statx,		FILTER_SYSEXIT },
+	{ PR_statx,		0 },
 	{ PR_swapoff,		0 },
 	{ PR_swapon,		0 },
 	{ PR_symlink,		0 },
@@ -429,6 +448,7 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_uselib,		0 },
 	{ PR_utime,		FILTER_SYSEXIT },
 	{ PR_utimensat,		0 },
+	{ PR_utimensat_time64,	0 },
 	{ PR_utimes,		0 },
 	{ PR_wait4,		FILTER_SYSEXIT },
 	{ PR_waitpid,		FILTER_SYSEXIT },
@@ -482,6 +502,48 @@ static int merge_filtered_sysnums(TALLOC_CTX *context, FilteredSysnum **sysnums,
 	return 0;
 }
 
+/* Flags of every traced syscall, by number: what the kernel would
+ * report through PTRACE_GETEVENTMSG at a seccomp stop, without the
+ * extra ptrace(2) call per stop.  Built on first use, in the tracer:
+ * enable_syscall_filtering() runs in the first tracee, before it
+ * execs, so nothing it computes is visible here.  */
+static uint8_t sysnum_flags[PR_NB_SYSNUM];
+static bool sysnum_flags_ready = false;
+
+static void merge_sysnum_flags(const FilteredSysnum *sysnums)
+{
+	size_t i;
+
+	for (i = 0; sysnums[i].value != PR_void; i++)
+		if (sysnums[i].value < PR_NB_SYSNUM)
+			sysnum_flags[sysnums[i].value] |= sysnums[i].flags;
+}
+
+/**
+ * Return the filter flags (FILTER_SYSEXIT, ...) of @sysnum for
+ * @tracee, merged from PRoot's own list and its extensions' ones
+ * exactly as enable_syscall_filtering() does.
+ */
+word_t filtered_sysnum_flags(const Tracee *tracee, Sysnum sysnum)
+{
+	if (!sysnum_flags_ready) {
+		Extension *extension;
+
+		merge_sysnum_flags(proot_sysnums);
+		if (tracee->extensions != NULL) {
+			LIST_FOREACH(extension, tracee->extensions, link) {
+				if (extension->filtered_sysnums != NULL)
+					merge_sysnum_flags(extension->filtered_sysnums);
+			}
+		}
+		sysnum_flags_ready = true;
+	}
+
+	if (sysnum >= PR_NB_SYSNUM)
+		return 0;
+	return sysnum_flags[sysnum];
+}
+
 /**
  * Tell the kernel to trace only syscalls handled by PRoot and its
  * extensions.  This filter will be enabled for the given @tracee and
@@ -523,12 +585,116 @@ int enable_syscall_filtering(const Tracee *tracee)
 	return 0;
 }
 
+/* Syscalls PRoot has to see only once a tracee owns an AF_NETLINK
+ * socket it emulates or acks (see the socket(2) handling in enter.c):
+ * the traffic of every other socket, and every other close(2), can
+ * reach the kernel without a stop.  Installed on top of the base
+ * filter with install_extra_filter() the first time such a socket is
+ * created, and inherited by the tracee's later children.  */
+const FilteredSysnum netlink_sysnums[] = {
+	{ PR_close,		0 },
+	{ PR_recvfrom,		0 },
+	{ PR_recvmsg,		0 },
+	{ PR_sendmsg,		0 },
+	{ PR_sendto,		0 },
+	FILTERED_SYSNUM_END,
+};
+
+/**
+ * Make @tracee install, on top of the filter it inherited, a seccomp
+ * filter that traces @sysnums.  Filters only stack, so this can add
+ * traced syscalls but never remove any.  The filter has to be
+ * installed by the tracee itself: this function is called at the
+ * enter stage of a syscall, which it turns into seccomp(2).  With
+ * @reissue the syscall the tracee asked for is re-issued right after
+ * it through the syscall chain, with its exit stage translated as
+ * usual; without it the caller has already answered that syscall
+ * itself and expects 0, which is what seccomp(2) returns on success.
+ * This function returns -errno if an error occurred, otherwise 0.
+ */
+int install_extra_filter(Tracee *tracee, const FilteredSysnum *sysnums, bool reissue)
+{
+	struct sock_fprog program = { .len = 0, .filter = NULL };
+	word_t filter_address;
+	word_t fprog_address;
+	size_t filter_size;
+	int status;
+
+	/* Without seccomp every syscall stops anyway.  */
+	if (tracee->seccomp != ENABLED)
+		return 0;
+
+	status = build_program_filter(sysnums, &program);
+	if (status < 0)
+		goto end;
+
+	/* The program goes on the tracee's stack: the filter itself,
+	 * then a struct sock_fprog laid out for the tracee's ABI (a
+	 * 16-bit length, padding, and a pointer of its word size).  */
+	filter_size = program.len * sizeof(struct sock_filter);
+	filter_address = alloc_mem(tracee, filter_size + 2 * sizeof_word(tracee));
+	if (filter_address == 0) {
+		status = -ENOMEM;
+		goto end;
+	}
+	fprog_address = filter_address + filter_size;
+
+	status = write_data(tracee, filter_address, program.filter, filter_size);
+	if (status < 0)
+		goto end;
+
+	if (sizeof_word(tracee) == 8) {
+		struct { uint16_t len; uint16_t pad[3]; uint64_t filter; } fprog = {
+			.len = program.len, .pad = { 0, 0, 0 }, .filter = filter_address };
+		status = write_data(tracee, fprog_address, &fprog, sizeof(fprog));
+	}
+	else {
+		struct { uint16_t len; uint16_t pad; uint32_t filter; } fprog = {
+			.len = program.len, .pad = 0, .filter = filter_address };
+		status = write_data(tracee, fprog_address, &fprog, sizeof(fprog));
+	}
+	if (status < 0)
+		goto end;
+
+	/* Queue the syscall the tracee asked for (with the arguments
+	 * PRoot may have changed) and use the current trap for
+	 * seccomp(2) instead.  TSYNC applies the filter to the other
+	 * threads of the process too, which share the socket.  */
+	if (reissue) {
+		status = restart_current_syscall_as_chained(tracee);
+		if (status < 0)
+			goto end;
+	}
+
+	set_sysnum(tracee, PR_seccomp);
+	poke_reg(tracee, SYSARG_1, SECCOMP_SET_MODE_FILTER);
+	poke_reg(tracee, SYSARG_2, SECCOMP_FILTER_FLAG_TSYNC);
+	poke_reg(tracee, SYSARG_3, fprog_address);
+
+	status = 0;
+end:
+	free_program_filter(&program);
+	return status;
+}
+
 #else
 
 #include "tracee/tracee.h"
 #include "attribute.h"
 
 int enable_syscall_filtering(const Tracee *tracee UNUSED)
+{
+	return 0;
+}
+
+int install_extra_filter(Tracee *tracee UNUSED, const FilteredSysnum *sysnums UNUSED, bool reissue UNUSED)
+{
+	return 0;
+}
+
+const FilteredSysnum netlink_sysnums[] = { FILTERED_SYSNUM_END };
+
+word_t filtered_sysnum_flags(const Tracee *tracee UNUSED, Sysnum sysnum UNUSED)
 {
 	return 0;
 }

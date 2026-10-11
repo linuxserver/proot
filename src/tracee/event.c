@@ -378,7 +378,6 @@ int event_loop()
 	while (1) {
 		int tracee_status;
 		Tracee *tracee;
-		int saved_errno;
 		int signal;
 		pid_t pid;
 
@@ -392,16 +391,13 @@ int event_loop()
 		/* As long as shadows are held, wake up periodically to
 		 * re-check them; the tracees concerned may all be
 		 * blocked, in which case no event is ever coming.  The
-		 * timer is disarmed as soon as waitpid(2) returns, so
-		 * SIGALRM cannot interfere with the ptrace helpers that
-		 * do their own waitpid(2).  */
+		 * timer stays armed across events (arming it around
+		 * every waitpid(2) cost a syscall per stop); the few
+		 * helpers with a waitpid(2) of their own retry on EINTR.  */
 		shadow_pipes_set_timer(shadow_pipes_held());
 
 		/* Wait for the next tracee's stop. */
 		pid = waitpid(-1, &tracee_status, __WALL);
-		saved_errno = errno;
-		shadow_pipes_set_timer(false);
-		errno = saved_errno;
 
 		if (pid < 0) {
 			if (errno == EINTR)
@@ -453,6 +449,8 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		seccomp_after_ptrace_enter = getenv("PROOT_ASSUME_NEW_SECCOMP") != NULL;
 		seccomp_after_ptrace_enter_checked = true;
 	}
+
+	tracee->_regs_prefetched = false;
 
 	/* When seccomp is enabled, all events are restarted in
 	 * non-stop mode, but this default choice could be overwritten
@@ -688,9 +686,15 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 			if (tracee->seccomp != ENABLED)
 				break;
 
-			status = ptrace(PTRACE_GETEVENTMSG, tracee->pid, NULL, &flags);
+			/* The filter flags of this syscall follow from its
+			 * number: no PTRACE_GETEVENTMSG at every stop.  The
+			 * registers fetched here are reused by
+			 * translate_syscall() right below.  */
+			status = fetch_regs(tracee);
 			if (status < 0)
 				break;
+			tracee->_regs_prefetched = true;
+			flags = filtered_sysnum_flags(tracee, get_sysnum(tracee, CURRENT));
 
 			/* Use the common ptrace flow when
 			 * sysexit has to be handled.  */

@@ -119,6 +119,12 @@ typedef struct tracee {
 	 * share that namespace.  */
 	bool fake_netns;
 
+	/* Set once this tracee installed the seccomp filter that traces
+	 * its netlink traffic and close(2) (see netlink_sysnums in
+	 * seccomp.c).  Also set on its later children, which inherit
+	 * the filter.  */
+	bool netlink_filter_installed;
+
 	/* Emulation of AF_NETLINK / NETLINK_ROUTE sockets for
 	 * sandbox helpers like bubblewrap that try to bring up the
 	 * loopback interface inside their would-be net namespace.
@@ -215,6 +221,11 @@ typedef struct tracee {
 	/* Value of the tracee's general purpose registers.  */
 	struct user_regs_struct _regs[NB_REG_VERSION];
 	bool _regs_were_changed;
+
+	/* Set when the event loop already fetched the registers of the
+	 * current stop, so translate_syscall() need not fetch them again.
+	 * Cleared at every event.  */
+	bool _regs_prefetched;
 	bool restore_original_regs;
 	bool restore_original_regs_after_seccomp_event;
 

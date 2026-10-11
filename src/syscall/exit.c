@@ -28,12 +28,14 @@
 #include <linux/prctl.h> /* PR_GET_AUXV, */
 #include <string.h>      /* strlen(3), */
 #include <unistd.h>      /* readlink(2), */
+#include <stdint.h>      /* uint32_t, */
 
 #include "cli/note.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
 #include "syscall/socket.h"
 #include "syscall/chain.h"
+#include "syscall/pipe_shadow.h"
 #include "syscall/heap.h"
 #include "syscall/rlimit.h"
 #include "execve/execve.h"
@@ -253,7 +255,8 @@ void translate_syscall_exit(Tracee *tracee)
 		break;
 
 	case PR_rename:
-	case PR_renameat: {
+	case PR_renameat:
+	case PR_renameat2: {
 		char old_path[PATH_MAX];
 		char new_path[PATH_MAX];
 		ssize_t old_length;
@@ -661,6 +664,25 @@ void translate_syscall_exit(Tracee *tracee)
 			VERBOSE(tracee, 5, "statfs() not for /dev/shm, not changing result");
 		}
 
+		goto end;
+	}
+
+	case PR_pipe:
+	case PR_pipe2: {
+		/* Shadow the read end of every new pipe for a while: a
+		 * child writer must not get EPIPE because ptrace
+		 * serialisation let the parent close its own read end
+		 * first (`echo <(echo a)`), see pipe_shadow.c.  */
+		uint32_t fds[2];
+
+		if ((int) syscall_result < 0)
+			goto end;
+
+		status = read_data(tracee, fds, peek_reg(tracee, ORIGINAL, SYSARG_1), sizeof(fds));
+		if (status < 0)
+			goto end;
+
+		shadow_pipe_read_end(tracee->pid, (int) fds[0]);
 		goto end;
 	}
 

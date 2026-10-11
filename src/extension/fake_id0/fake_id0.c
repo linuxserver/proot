@@ -297,6 +297,7 @@ typedef struct {
 
 /* List of syscalls handled by this extensions.  */
 static FilteredSysnum filtered_sysnums[] = {
+	{ PR_statx,		FILTER_SYSEXIT },
 #ifdef USERLAND
 	{ PR_access,		FILTER_SYSEXIT },
 	{ PR_creat,		FILTER_SYSEXIT },
